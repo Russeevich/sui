@@ -294,6 +294,57 @@ impl TransactionBuilder {
         ))
     }
 
+    pub async fn mint_b(
+        &self,
+        signer: SuiAddress,
+        package_object_id: ObjectID,
+        module: &str,
+        function: &str,
+        type_args: Vec<SuiTypeTag>,
+        call_args: Vec<SuiJsonValue>,
+        gas: Option<ObjectID>,
+        gas_budget: u64,
+        amount: u64,
+    ) -> anyhow::Result<TransactionData> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let amt_arg = builder.pure(amount).unwrap();
+
+        let splited = Command::SplitCoins(Argument::GasCoin, vec![amt_arg]);
+
+        builder.command(splited);
+
+        self.single_move_call(
+            &mut builder,
+            package_object_id,
+            module,
+            function,
+            type_args,
+            call_args,
+        )
+        .await?;
+        let pt = builder.finish();
+        let input_objects = pt
+            .input_objects()?
+            .iter()
+            .flat_map(|obj| match obj {
+                InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let gas_price = self.0.get_reference_gas_price().await?;
+        let gas = self
+            .select_gas(signer, gas, gas_budget, input_objects, gas_price)
+            .await?;
+
+        Ok(TransactionData::new(
+            TransactionKind::programmable(pt),
+            signer,
+            gas,
+            gas_budget,
+            gas_price,
+        ))
+    }
+
     pub async fn single_move_call(
         &self,
         builder: &mut ProgrammableTransactionBuilder,
