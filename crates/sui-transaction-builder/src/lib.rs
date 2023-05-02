@@ -313,7 +313,7 @@ impl TransactionBuilder {
 
         builder.command(splited);
 
-        self.single_move_call(
+        self.single_move_call_with_first_nested(
             &mut builder,
             package_object_id,
             module,
@@ -367,6 +367,37 @@ impl TransactionBuilder {
                 builder, package, &module, &function, &type_args, call_args,
             )
             .await?;
+
+        builder.command(Command::move_call(
+            package, module, function, type_args, call_args,
+        ));
+        Ok(())
+    }
+
+    pub async fn single_move_call_with_first_nested(
+        &self,
+        builder: &mut ProgrammableTransactionBuilder,
+        package: ObjectID,
+        module: &str,
+        function: &str,
+        type_args: Vec<SuiTypeTag>,
+        call_args: Vec<SuiJsonValue>,
+    ) -> anyhow::Result<()> {
+        let module = Identifier::from_str(module)?;
+        let function = Identifier::from_str(function)?;
+
+        let type_args = type_args
+            .into_iter()
+            .map(|ty| ty.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut call_args = self
+            .resolve_and_checks_json_args(
+                builder, package, &module, &function, &type_args, call_args,
+            )
+            .await?;
+
+        call_args[0] = Argument::NestedResult(0, 0);
 
         builder.command(Command::move_call(
             package, module, function, type_args, call_args,
