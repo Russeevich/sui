@@ -60,6 +60,44 @@ impl TransactionBuilder {
         Self(data_reader)
     }
 
+    pub async fn select_gas_once(
+        &self,
+        signer: SuiAddress,
+        input_gas: Option<ObjectID>,
+        budget: u64,
+        input_objects: Vec<ObjectID>,
+        gas_price: u64,
+    ) -> Result<ObjectRef, anyhow::Error> {
+        if budget < gas_price {
+            bail!("Gas budget {budget} is less than the reference gas price {gas_price}. The gas budget must be at least the current reference gas price of {gas_price}.")
+        }
+        if let Some(gas) = input_gas {
+            self.get_object_ref(gas).await
+        } else {
+            let gas_objs = self.0.get_owned_objects(signer, GasCoin::type_()).await?;
+
+            for obj in gas_objs {
+                let response = self
+                    .0
+                    .get_object_with_options(obj.object_id, SuiObjectDataOptions::new().with_bcs())
+                    .await?;
+                let obj = response.object()?;
+                let gas: GasCoin = bcs::from_bytes(
+                    &obj.bcs
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("bcs field is unexpectedly empty"))?
+                        .try_as_move()
+                        .ok_or_else(|| anyhow!("Cannot parse move object to gas object"))?
+                        .bcs_bytes,
+                )?;
+                if !input_objects.contains(&obj.object_id) && gas.value() >= budget {
+                    return Ok(obj.object_ref());
+                }
+            }
+            Err(anyhow!("Cannot find gas coin for signer address [{signer}] with amount sufficient for the required gas amount [{budget}]."))
+        }
+    }
+
     async fn select_gas(
         &self,
         signer: SuiAddress,
@@ -294,6 +332,72 @@ impl TransactionBuilder {
         ))
     }
 
+    pub async fn mint_t(
+        &self,
+        signer: SuiAddress,
+        package_object_id: ObjectID,
+        module: &str,
+        function: &str,
+        type_args: Vec<SuiTypeTag>,
+        call_args: Vec<SuiJsonValue>,
+        gas: Option<ObjectID>,
+        gas_budget: u64,
+        amount: u64,
+        gas_price: u64,
+    ) -> anyhow::Result<TransactionData> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+
+        if call_args.len() == 5 {
+            let amt_arg = builder.pure(amount).unwrap();
+
+            let splited = Command::SplitCoins(Argument::GasCoin, vec![amt_arg]);
+
+            builder.command(splited);
+
+            self.single_move_call_with_nested(
+                &mut builder,
+                package_object_id,
+                module,
+                function,
+                type_args,
+                call_args,
+                1,
+            )
+            .await?;
+        } else {
+            self.single_move_call(
+                &mut builder,
+                package_object_id,
+                module,
+                function,
+                type_args,
+                call_args,
+            )
+            .await?;
+        }
+
+        let pt = builder.finish();
+        let input_objects = pt
+            .input_objects()?
+            .iter()
+            .flat_map(|obj| match obj {
+                InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let gas = self
+            .select_gas(signer, gas, gas_budget, input_objects, gas_price)
+            .await?;
+
+        Ok(TransactionData::new(
+            TransactionKind::programmable(pt),
+            signer,
+            gas,
+            gas_budget,
+            gas_price,
+        ))
+    }
+
     pub async fn mint_b(
         &self,
         signer: SuiAddress,
@@ -314,13 +418,14 @@ impl TransactionBuilder {
 
         builder.command(splited);
 
-        self.single_move_call_with_first_nested(
+        self.single_move_call_with_nested(
             &mut builder,
             package_object_id,
             module,
             function,
             type_args,
             call_args,
+            0,
         )
         .await?;
         let pt = builder.finish();
@@ -374,7 +479,7 @@ impl TransactionBuilder {
         Ok(())
     }
 
-    pub async fn single_move_call_with_first_nested(
+    pub async fn single_move_call_with_nested(
         &self,
         builder: &mut ProgrammableTransactionBuilder,
         package: ObjectID,
@@ -382,6 +487,7 @@ impl TransactionBuilder {
         function: &str,
         type_args: Vec<SuiTypeTag>,
         call_args: Vec<SuiJsonValue>,
+        index: usize,
     ) -> anyhow::Result<()> {
         let module = Identifier::from_str(module)?;
         let function = Identifier::from_str(function)?;
@@ -397,7 +503,7 @@ impl TransactionBuilder {
             )
             .await?;
 
-        call_args[0] = Argument::NestedResult(0, 0);
+        call_args[index] = Argument::NestedResult(0, 0);
 
         builder.command(Command::move_call(
             package, module, function, type_args, call_args,
